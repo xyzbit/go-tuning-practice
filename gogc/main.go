@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof" // 导入 pprof，它会自动注册 HTTP 处理程序
+	"runtime"
 	"runtime/debug"
 	"time"
 
@@ -132,11 +133,24 @@ func main() {
 	allocationRate := flag.Int("alloc-rate", 1000, "对象分配速率 (对象/秒)")
 	longLivedRatio := flag.Float64("long-lived", 0.05, "长期存活对象比例 (0.0-1.0)")
 	loadType := flag.String("load-type", "constant", "负载类型: constant(固定), wave(波动), spike(尖刺)")
-	// TODO 读取 memlimit 参数
+	memlimit := flag.Int("memlimit", 0, "内存限制 (MB), 默认不限制")
+	ballast := flag.Int("ballast", 0, " ballast 大小 (MB), 默认不限制")
 	flag.Parse()
 
 	// 设置 GOGC 值
-	debug.SetGCPercent(*gcPercent)
+	if gcPercent != nil {
+		// max gcPercent = (maxMem*0.7 - liveheapmem) / liveheapmem * 100
+		debug.SetGCPercent(*gcPercent)
+	}
+	if memlimit != nil && *memlimit > 0 {
+		log.Printf("设置内存限制: %d MB", *memlimit)
+		debug.SetMemoryLimit(int64(*memlimit * 1024 * 1024))
+	}
+	if ballast != nil && *ballast > 0 {
+		log.Printf("设置 ballast: %d MB", *ballast)
+		ballastBucket := make([]byte, *ballast*1024*1024)
+		runtime.KeepAlive(ballastBucket)
+	}
 	log.Printf("GOGC 设置为: %d", *gcPercent)
 
 	// 启动 HTTP 服务
