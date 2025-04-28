@@ -59,6 +59,8 @@ docker-compose down
 
 - Prometheus 界面访问: http://localhost:9090
 - Grafana 界面访问: http://localhost:3000 (用户名/密码: admin/admin)
+  - 配置 Data Source 为 Prometheus，url 填写为 `http://go-tuning-prometheus:9090` 或 `http://宿主机IP:9090`
+  - import grafana dashboard 文件 `grafana.json`
 
 ## Web 接口
 
@@ -74,50 +76,134 @@ docker-compose down
 
 ## 常用 Prometheus 查询语句
 
-### GC 基本指标
+# 监控 Go 应用指标配置方案
 
+要监控您需要的指标（CPU、内存消耗、GC的CPU占比以及请求延迟），我们需要完善代码并配置正确的 Prometheus 查询。
+
+## 代码完善部分
+
+需要在 main.go 中添加请求延迟监控的代码：
+
+```go
+// 在 import 部分添加
+import (
+    "time"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// 添加请求延迟相关的指标定义
+var (
+    requestDuration = promauto.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "http_request_duration_seconds",
+            Help:    "HTTP请求延迟(秒)",
+            Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+        },
+        []string{"handler", "status"},
+    )
+)
+
+// 创建一个包装中间件来记录请求延迟
+func metricsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        
+        // 调用包装的处理函数
+        recorder := &statusRecorder{
+            ResponseWriter: w,
+            Status:         200,
+        }
+        next.ServeHTTP(recorder, r)
+        
+        // 记录请求延迟
+        duration := time.Since(start).Seconds()
+        requestDuration.WithLabelValues(
+            r.URL.Path,
+            fmt.Sprintf("%d", recorder.Status),
+        ).Observe(duration)
+    })
+}
+
+// 用于捕获状态码的响应写入器
+type statusRecorder struct {
+    http.ResponseWriter
+    Status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+    r.Status = status
+    r.ResponseWriter.WriteHeader(status)
+}
 ```
-# GC 执行次数 (每秒)
-rate(go_gc_cycles_total[1m])
 
-# GC 暂停时间 (毫秒)
-rate(go_gc_pause_total_ns[1m]) / 1000000
+然后在 HTTP 服务配置部分修改代码：
 
-# 堆内存分配情况 (MB)
-go_memstats_heap_alloc_bytes / 1024 / 1024
+```go
+// 将 HTTP 服务配置部分修改为
+// 启动 HTTP 服务
+http.Handle("/metrics", promhttp.Handler())
+http.Handle("/", metricsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    if r.URL.Path != "/" {
+        http.NotFound(w, r)
+        return
+    }
+    fmt.Fprintf(w, "GC 压测服务运行中.\n\n")
+    fmt.Fprintf(w, "- 访问 /metrics 获取 Prometheus 指标\n")
+    fmt.Fprintf(w, "- 访问 /debug/pprof/ 获取性能分析数据\n")
+    fmt.Fprintf(w, "- 访问 /debug/pprof/heap 查看内存分配情况\n")
+    fmt.Fprintf(w, "- 访问 /debug/pprof/goroutine 查看 goroutine 信息\n")
+})))
 
-# 堆对象数量
-go_memstats_heap_objects
-
-# 分配对象速率 (只支持自定义指标)
-rate(alloc_objects_total[1m])
+// 对 pprof 处理函数也应用中间件
+http.Handle("/debug/pprof/", metricsMiddleware(http.DefaultServeMux))
 ```
 
-### GC 效率分析
+## Prometheus 查询语句
 
-```
-# GC CPU 使用率估算
-rate(go_gc_pause_total_ns[1m]) / 1000000000
+### 1. CPU 消耗监控
 
-# 每次 GC 回收的内存量估算 (MB)
-(rate(go_memstats_heap_alloc_bytes[1m]) / rate(go_gc_cycles_total[1m])) / 1024 / 1024
-
-# GC 触发 (次/秒)
-go_gc_duration_seconds_count
+```promql
+# 当前go进程CPU使用量（百分比）
+process_cpu_usage_percent
 ```
 
-### 内存使用趋势
+### 2. 内存消耗监控
 
+```promql
+# 当前堆内存使用量(bytes)
+go_memstats_alloc_bytes{job="gogc_test"}
+
+# 堆内存分配速率(bytes/s)
+rate(go_memstats_alloc_bytes[1m])
+
+# 进程内存使用量(bytes)
+process_memory_bytes
 ```
-# 堆内存使用率
-go_memstats_heap_inuse_bytes / go_memstats_heap_sys_bytes
 
-# 下一次 GC 触发点 (MB)
-go_memstats_next_gc_bytes / 1024 / 1024
+### 3. GC情况
 
-# 内存分配速率 (MB/s)
-rate(go_memstats_alloc_bytes_total[1m]) / 1024 / 1024
+```promql
+# GC频率
+rate(go_gc_duration_seconds_count{job="gogc_test"}[1m])
+
+# GC 
 ```
+
+### 4. 请求延迟监控
+
+```promql
+# 平均请求延迟(秒)
+sum(rate(http_request_duration_seconds_sum{job="gogc_test"}[5m])) by (handler) / 
+sum(rate(http_request_duration_seconds_count{job="gogc_test"}[5m])) by (handler)
+
+# 请求延迟P95(秒)
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="gogc_test"}[5m])) by (handler, le))
+
+# 请求延迟P99(秒)
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="gogc_test"}[5m])) by (handler, le))
+```
+
 
 ## 使用 pprof 进行分析
 
@@ -138,8 +224,17 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 在以下三种负载模式下分别测试：
 - **固定负载** - 最基本的压测模式，适合测试基准性能和调优参数
+```
+   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=constant -duration=60
+```
 - **波动负载** - 更接近真实世界的应用场景，适合测试 GC 对动态变化流量的适应性
+```
+   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=wave -duration=60
+```
 - **尖刺负载** - 测试系统在突发流量下的 GC 行为，适合评估系统在极端条件下的稳定性
+```
+   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=spike -duration=60
+```
 
 ### 统一的测试用例及期望效果
 
