@@ -45,6 +45,7 @@ var (
 
 func main() {
 	flag.Parse()
+	// 监听中断信号
 	signal.Notify(stop, os.Interrupt)
 
 	// 创建 HTTP 客户端

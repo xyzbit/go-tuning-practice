@@ -74,91 +74,6 @@ docker-compose down
 - `/debug/pprof/allocs` - 内存分配分析
 - `/debug/pprof/mutex` - 锁竞争分析
 
-## 常用 Prometheus 查询语句
-
-# 监控 Go 应用指标配置方案
-
-要监控您需要的指标（CPU、内存消耗、GC的CPU占比以及请求延迟），我们需要完善代码并配置正确的 Prometheus 查询。
-
-## 代码完善部分
-
-需要在 main.go 中添加请求延迟监控的代码：
-
-```go
-// 在 import 部分添加
-import (
-    "time"
-    "github.com/prometheus/client_golang/prometheus"
-    "github.com/prometheus/client_golang/prometheus/promauto"
-)
-
-// 添加请求延迟相关的指标定义
-var (
-    requestDuration = promauto.NewHistogramVec(
-        prometheus.HistogramOpts{
-            Name:    "http_request_duration_seconds",
-            Help:    "HTTP请求延迟(秒)",
-            Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-        },
-        []string{"handler", "status"},
-    )
-)
-
-// 创建一个包装中间件来记录请求延迟
-func metricsMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        start := time.Now()
-        
-        // 调用包装的处理函数
-        recorder := &statusRecorder{
-            ResponseWriter: w,
-            Status:         200,
-        }
-        next.ServeHTTP(recorder, r)
-        
-        // 记录请求延迟
-        duration := time.Since(start).Seconds()
-        requestDuration.WithLabelValues(
-            r.URL.Path,
-            fmt.Sprintf("%d", recorder.Status),
-        ).Observe(duration)
-    })
-}
-
-// 用于捕获状态码的响应写入器
-type statusRecorder struct {
-    http.ResponseWriter
-    Status int
-}
-
-func (r *statusRecorder) WriteHeader(status int) {
-    r.Status = status
-    r.ResponseWriter.WriteHeader(status)
-}
-```
-
-然后在 HTTP 服务配置部分修改代码：
-
-```go
-// 将 HTTP 服务配置部分修改为
-// 启动 HTTP 服务
-http.Handle("/metrics", promhttp.Handler())
-http.Handle("/", metricsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    if r.URL.Path != "/" {
-        http.NotFound(w, r)
-        return
-    }
-    fmt.Fprintf(w, "GC 压测服务运行中.\n\n")
-    fmt.Fprintf(w, "- 访问 /metrics 获取 Prometheus 指标\n")
-    fmt.Fprintf(w, "- 访问 /debug/pprof/ 获取性能分析数据\n")
-    fmt.Fprintf(w, "- 访问 /debug/pprof/heap 查看内存分配情况\n")
-    fmt.Fprintf(w, "- 访问 /debug/pprof/goroutine 查看 goroutine 信息\n")
-})))
-
-// 对 pprof 处理函数也应用中间件
-http.Handle("/debug/pprof/", metricsMiddleware(http.DefaultServeMux))
-```
-
 ## Prometheus 查询语句
 
 ### 1. CPU 消耗监控
@@ -225,22 +140,22 @@ go tool pprof http://localhost:8080/debug/pprof/block
 在以下三种负载模式下分别测试：
 - **固定负载** - 最基本的压测模式，适合测试基准性能和调优参数
 ```
-   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=constant -duration=60
+   go run ./press/main.go -host=localhost -port=8080 -rps=100 -load-type=constant -duration=180
 ```
 - **波动负载** - 更接近真实世界的应用场景，适合测试 GC 对动态变化流量的适应性
 ```
-   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=wave -duration=60
+   go run ./press/main.go -host=localhost -port=8080 -rps=100 -load-type=wave -duration=180
 ```
 - **尖刺负载** - 测试系统在突发流量下的 GC 行为，适合评估系统在极端条件下的稳定性
 ```
-   ./loadtest -host=localhost -port=8080 -rps=100 -load-type=spike -duration=60
+   go run ./press/main.go -host=localhost -port=8080 -rps=100 -load-type=spike -duration=180
 ```
 
 ### 统一的测试用例及期望效果
 
 #### 基准测试
 ```bash
-./gogc_test -obj-size=4096 -load-type=constant
+./gogc_test -obj-size=4096
 ```
 - **期望效果**：
   - GC频率：每分钟约 8-12 次
@@ -251,7 +166,7 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 #### GOGC调优测试
 ```bash
-./gogc_test -obj-size=4096 -gogc=200 -load-type=constant
+./gogc_test -obj-size=4096 -gogc=200
 ```
 - **期望效果**：
   - GC频率：每分钟约 4-6 次（较基准测试减少约 50%）
@@ -262,7 +177,7 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 #### Ballast技术测试
 ```bash
-./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -load-type=constant
+./gogc_test -obj-size=4096 -gogc=200 -ballast=100 
 ```
 - **期望效果**：
   - GC频率：每分钟约 2-4 次（较基准测试减少约 70%）
@@ -273,7 +188,7 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 #### 内存限制测试
 ```bash
-./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250 -load-type=constant
+./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250
 ```
 - **期望效果**：
   - GC频率：当接近内存限制时可能提高到每分钟 6-8 次
@@ -284,10 +199,10 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 ### 波动负载测试建议
 
-对于波动负载测试，建议使用相同的参数配置，但将 `-load-type` 设置为 `wave`：
+对于波动负载测试，建议使用相同的参数配置，但 `./press/main.go` 将 `-load-type` 设置为 `wave`：
 
 ```bash
-./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250 -load-type=wave
+./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250
 ```
 
 - **期望效果**：
@@ -298,10 +213,10 @@ go tool pprof http://localhost:8080/debug/pprof/block
 
 ### 尖刺负载测试建议
 
-对于尖刺负载测试，建议使用相同的参数配置，但将 `-load-type` 设置为 `spike`：
+对于尖刺负载测试，建议使用相同的参数配置，但 `./press/main.go` 将 `-load-type` 设置为 `spike`：
 
 ```bash
-./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250 -load-type=spike
+./gogc_test -obj-size=4096 -gogc=200 -ballast=100 -memlimit=250
 ```
 
 - **期望效果**：
