@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package hello;
+
+option go_package = "monitor/server/grpc/pb";
+
+// Hello 服务定义
+service HelloService {
+  // Hello 方法 - 简单的一元 RPC
+  rpc Hello(HelloRequest) returns (HelloResponse) {}
+  
+  // HelloStream 方法 - 服务端流式 RPC
+  rpc HelloStream(HelloRequest) returns (stream HelloResponse) {}
+  
+  // HelloClientStream 方法 - 客户端流式 RPC
+  rpc HelloClientStream(stream HelloRequest) returns (HelloResponse) {}
+  
+  // HelloBiStream 方法 - 双向流式 RPC
+  rpc HelloBiStream(stream HelloRequest) returns (stream HelloResponse) {}
+}
+
+// 请求消息
+message HelloRequest {
+  string name = 1;           // 用户名
+  string message = 2;        // 自定义消息
+  map<string, string> metadata = 3;  // 元数据
+}
+
+// 响应消息
+message HelloResponse {
+  string greeting = 1;       // 问候语
+  int64 timestamp = 2;       // 时间戳
+  string server_name = 3;    // 服务器名称
+  Status status = 4;         // 状态
+}
+
+// 状态枚举
+enum Status {
+  UNKNOWN = 0;
+  SUCCESS = 1;
+  ERROR = 2;
+}
